@@ -1238,8 +1238,83 @@ Symbol *Funcdata::linkSymbol(Varnode *vn)
 
   return sym;
 }
+/// \brief Find or create a Symbol for the given Varnode, using an explicit usepoint
+///
+/// Identical to linkSymbol(), except the usepoint used both to query for an
+/// existing overlapping entry and, if none is found, to register a new one,
+/// is passed in explicitly rather than derived from vn->getUsePoint(). This
+/// matters for annotation-style Varnodes (e.g. a SEGMENTOP's raw input) whose
+/// printed representation is resolved by printc.cc's pushAnnotation() via its
+/// own independent symScope->queryContainer(vn->getAddr(), size, op->getAddr())
+/// call, bound to the consuming PcodeOp's address -- not through
+/// vn->getHigh()->getSymbol(). If linkSymbol() borrows a pre-existing entry
+/// registered at a different usepoint, that entry's range may not cover this
+/// op's address, and pushAnnotation()'s lookup then misses even though a
+/// Symbol genuinely exists. Passing the consuming op's own address as
+/// usepoint here guarantees the two lookups agree. (review15.md section 21+)
+/// \param vn is the given Varnode
+/// \param usepoint is the address to use for both the containment query and any new entry
+/// \return the associated Symbol or NULL
+Symbol *Funcdata::linkSymbolAtUsepoint(Varnode *vn,const Address &usepoint)
 
-/// A reference to a symbol (i.e. &varname) is typically stored as a PTRSUB operation, where the
+{
+  if (vn->isProtoPartial())
+    linkProtoPartial(vn);
+  HighVariable *high = vn->getHigh();
+  Symbol *sym = high->getSymbol();
+  if (sym != (Symbol *)0 && vn->getSymbolEntry() != (SymbolEntry *)0)
+    return sym;		// Already assigned to a usable entry
+
+  uint4 fl = 0;
+  SymbolEntry *entry = localmap->queryProperties(vn->getAddr(), 1, usepoint, fl);
+  if (entry != (SymbolEntry *)0 && !entry->isConflict()) {
+    vn->setSymbolEntry(entry);
+    return entry->getSymbol();
+  }
+  if (!vn->isPersist()) {	// Only create local symbol
+    if (detectSymbolConflicts(vn)) {
+      entry = localmap->addSymbolWithConflict("", high->getType(), vn);
+    }
+    else {
+      entry = localmap->addSymbol("", high->getType(), vn->getAddr(), usepoint);
+    }
+    sym = entry->getSymbol();
+    vn->setSymbolEntry(entry);
+  }
+
+  return sym;
+}
+
+/// \brief Find or create a Symbol for an annotation Varnode, using an explicit usepoint
+///
+/// Annotation Varnodes (vn->isAnnotation()) never get a HighVariable
+/// assigned -- Funcdata::assignHigh() explicitly skips them by design,
+/// since they're not meant to be treated as ordinary program variables.
+/// linkSymbol()/linkSymbolAtUsepoint() both start by dereferencing
+/// vn->getHigh(), so neither can be used for an annotation Varnode. This
+/// method does the equivalent lookup-or-create using the same Scope API
+/// (queryProperties / addSymbol) but never touches vn->getHigh(), and
+/// supplies an explicit sized-integer Datatype instead of borrowing
+/// high->getType(). See review16.md "linkSymbolAtUsepoint approach is
+/// fundamentally broken for annotation Varnodes" (2026-08-22).
+/// \param vn is the given annotation Varnode
+/// \param usepoint is the address to use for both the containment query and any new entry
+/// \return the associated Symbol or NULL
+Symbol *Funcdata::linkAnnotationSymbolAtUsepoint(Varnode *vn,const Address &usepoint)
+
+{
+  uint4 fl = 0;
+  SymbolEntry *entry = localmap->queryProperties(vn->getAddr(),1,usepoint,fl);
+  if (entry == (SymbolEntry *)0 || entry->isConflict()) {
+    Datatype *ct = glb->types->getBase(vn->getSize(),TYPE_UNKNOWN);
+    string regname = glb->translate->getRegisterName(vn->getSpace(),vn->getOffset(),vn->getSize());
+    entry = localmap->addSymbol(regname,ct,vn->getAddr(),usepoint);
+  }
+  if (entry == (SymbolEntry *)0) return (Symbol *)0;
+  vn->setSymbolEntry(entry);
+  return entry->getSymbol();
+}
+
 /// first input Varnode is a \e spacebase Varnode indicating whether the symbol is on the \e stack or at
 /// a \e global RAM location.  The second input Varnode is a constant encoding the address of the symbol.
 /// This method takes this constant Varnode, recovers the symbol it is referring to, and stores

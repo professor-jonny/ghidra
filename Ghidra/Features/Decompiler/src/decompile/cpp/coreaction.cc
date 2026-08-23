@@ -1,4 +1,4 @@
-/* ###
+﻿/* ###
  * IP: GHIDRA
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 #include "subflow.hh"
 #include "constseq.hh"
 #include "bitfield.hh"
+#include <iostream>
 
 namespace ghidra {
 

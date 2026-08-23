@@ -348,6 +348,18 @@ protected:
   /// \param op is the PcodeOp which takes the annotation as input
   virtual void pushAnnotation(const Varnode *vn,const PcodeOp *op)=0;
 
+  /// \brief Push a self-referential register-arithmetic Varnode as a
+  /// binary expression (e.g. "SP - 2") instead of falling through to
+  /// pushAnnotation()'s register0x0e-style fallback name.
+  ///
+  /// Default implementation does nothing and returns \b false, so
+  /// pushVnExplicit() falls back to the normal pushAnnotation() path --
+  /// see review16.md Step 3. Only PrintC overrides this currently.
+  /// \param vn is the self-referential-arithmetic annotation Varnode
+  /// \param op is the PcodeOp (expected CPUI_SEGMENTOP) consuming it
+  /// \return \b true if the expression form was successfully pushed
+  virtual bool pushSegmentRegisterExpression(const Varnode *vn,const PcodeOp *op) { return false; }
+
   /// \brief Push a specific Symbol onto the RPN stack
   ///
   /// \param sym is the given Symbol

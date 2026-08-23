@@ -208,6 +208,7 @@ protected:
   virtual bool pushEquate(uintb val,int4 sz,const EquateSymbol *sym,
 			  const Varnode *vn,const PcodeOp *op);
   virtual void pushAnnotation(const Varnode *vn,const PcodeOp *op);
+  virtual bool pushSegmentRegisterExpression(const Varnode *vn,const PcodeOp *op);
   virtual void pushSymbol(const Symbol *sym,const Varnode *vn,const PcodeOp *op);
   virtual void pushUnnamedLocation(const Address &addr,
 				   const Varnode *vn,const PcodeOp *op);

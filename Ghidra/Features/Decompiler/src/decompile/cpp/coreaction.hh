@@ -769,6 +769,29 @@ public:
   }
   virtual int4 apply(Funcdata &data);
 };
+/// \brief Restore register identity to a SEGMENTOP input produced by
+/// self-referential arithmetic on a base/segment register.
+///
+/// For architectures using a <segmentop> construct (e.g. an SP/FP widened
+/// into a larger address space via a base-register CALLOTHER), a base
+/// register that is reassigned to a value computed from itself within a
+/// single instruction (e.g. "SP = SP - 2") produces a new SSA Varnode at
+/// the register's own storage address whose HighVariable never receives a
+/// Symbol -- see Ghidra issue #817 (the unaff_SS case) for the same
+/// mechanism on x86. This Action runs after ActionSegmentize and, for each
+/// SEGMENTOP input Varnode with no Symbol whose defining op is an
+/// INT_ADD/INT_SUB of a constant against a Varnode occupying the SAME
+/// register storage, links a Symbol onto it via Funcdata::linkSymbol so it
+/// no longer falls back to a raw register-offset label at print time.
+class ActionSegmentRegisterIdentity : public Action {
+public:
+  ActionSegmentRegisterIdentity(const string &g) : Action(0, "segmentregisteridentity",g) {}	///< Constructor
+  virtual Action *clone(const ActionGroupList &grouplist) const {
+    if (!grouplist.contains(getGroup())) return (Action *)0;
+    return new ActionSegmentRegisterIdentity(getGroup());
+  }
+  virtual int4 apply(Funcdata &data);
+};
 
 /// \brief Determine active parameters to sub-functions
 ///

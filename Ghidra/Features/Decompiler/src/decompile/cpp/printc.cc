@@ -1920,6 +1920,61 @@ bool PrintC::pushEquate(uintb val,int4 sz,const EquateSymbol *sym,const Varnode 
   return false;
 }
 
+/// \brief Push a self-referential register-arithmetic Varnode as a binary
+/// expression using the base register's own existing symbol/name (e.g.
+/// "SP - 2") instead of the register0x0e-style annotation fallback.
+///
+/// Looks up an existing Symbol for the register's storage address, keyed
+/// at the CONSUMING op's address as usepoint (matching pushAnnotation's
+/// own queryContainer call above) rather than vn's own address. Fails
+/// safe (returns false) if no such Symbol is found, letting the caller
+/// fall back to pushAnnotation(). See review16.md Step 3.
+/// \param vn is the self-referential-arithmetic annotation Varnode
+/// \param op is the PcodeOp (expected CPUI_SEGMENTOP) consuming it
+/// \return \b true if the expression form was successfully pushed
+bool PrintC::pushSegmentRegisterExpression(const Varnode *vn,const PcodeOp *op)
+
+{
+  const PcodeOp *def = vn->getDef();		// already confirmed non-null
+						// by isSelfReferentialRegisterArithmetic
+  Funcdata *fd = const_cast<Funcdata *>(op->getParent()->getFuncdata());
+  Varnode *mutvn = const_cast<Varnode *>(vn);
+
+  // vn is an annotation Varnode -- it deliberately never gets a
+  // HighVariable (Funcdata::assignHigh skips isAnnotation() Varnodes by
+  // design), so linkSymbol()/linkSymbolAtUsepoint() cannot be used here:
+  // both dereference vn->getHigh() unconditionally. Use the dedicated
+  // annotation-safe variant instead -- see review16.md
+  // "linkSymbolAtUsepoint approach is fundamentally broken for
+  // annotation Varnodes".
+  Symbol *sym = fd->linkAnnotationSymbolAtUsepoint(mutvn, op->getAddr());
+  if (sym == (Symbol *)0) return false;		// fail safe -- couldn't create/find, let caller fall back
+
+  const Varnode *amt = def->getIn(1);		// already confirmed constant
+  OpCode opc = def->code();
+  uintb rawval = amt->getOffset();
+  int4 sz = amt->getSize();
+  uintb mask = calc_mask(sz);
+  uintb signbit = (mask >> 1) + 1;
+  bool showAsSubtract = (opc == CPUI_INT_SUB);
+  uintb dispval = rawval;
+  // An H8 "SP = SP - 2" instruction pcode-lowers to INT_ADD(SP, 0xfffe)
+  // (the two's-complement wraparound constant), not a genuine INT_SUB --
+  // confirmed via analyze_dataflow, see review16.md. Detect that shape
+  // here and print it as a subtraction of the true magnitude instead of
+  // a raw unsigned "+ 0xfffe", matching how a human reads the intent.
+  if (opc == CPUI_INT_ADD && (rawval & signbit) != 0) {
+    showAsSubtract = true;
+    dispval = (~rawval + 1) & mask;	// two's-complement negate to get the magnitude
+  }
+  const OpToken &tok = showAsSubtract ? binary_minus : binary_plus;
+
+  pushOp(&tok,op);
+  pushSymbol(sym,vn,op);				// pushes "SP" (or whatever the real name is)
+  push_integer(dispval,sz,false,syntax,amt,op,amt->getType()->getDisplayFormat());
+  return true;
+}
+
 void PrintC::pushAnnotation(const Varnode *vn,const PcodeOp *op)
 
 {

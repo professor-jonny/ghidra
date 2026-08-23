@@ -210,6 +210,29 @@ void PrintLanguage::pushVn(const Varnode *vn,const PcodeOp *op,uint4 m)
   nodepend.emplace_back(vn,op,m);
 }
 
+/// \brief Check if a Varnode's value was computed by INT_ADD/INT_SUB
+/// against a constant -- the shape produced when a base/segment register
+/// is reassigned to a value computed from itself (e.g. H8 link/unlk's
+/// "SP = SP - 2"), landing back in the register's own storage.
+/// Duplicated (const-adapted) from coreaction.cc's static helper of the
+/// same name -- see review16.md Step 1. Kept as a separate local static
+/// here rather than shared via a header, per the plan.
+/// \param vn is the Varnode to test
+/// \return \b true if vn is defined by arithmetic against a constant
+static bool isSelfReferentialRegisterArithmetic(const Varnode *vn)
+
+{
+  if (vn == (const Varnode *)0 || vn->isConstant()) return false;
+  const PcodeOp *def = vn->getDef();
+  if (def == (const PcodeOp *)0) return false;
+  OpCode opc = def->code();
+  if (opc != CPUI_INT_ADD && opc != CPUI_INT_SUB) return false;
+  if (def->numInput() != 2) return false;
+  const Varnode *amt = def->getIn(1);
+  if (!amt->isConstant()) return false;
+  return true;
+}
+
 /// This method pushes a given Varnode as a \b leaf of the current expression.
 /// It decides how the Varnode should get emitted, as a symbol, constant, etc.,
 /// and then pushes the resulting leaf Atom onto the stack.
@@ -219,6 +242,12 @@ void PrintLanguage::pushVnExplicit(const Varnode *vn,const PcodeOp *op)
 
 {
   if (vn->isAnnotation()) {
+    if (op->code()==CPUI_SEGMENTOP && isSelfReferentialRegisterArithmetic(vn)) {
+      if (pushSegmentRegisterExpression(vn,op)) return;
+      // fall through to pushAnnotation() if the expression form couldn't
+      // be built (e.g. no base-register symbol found) -- fail safe, never
+      // crash or silently print nothing
+    }
     pushAnnotation(vn,op);
     return;
   }
@@ -527,7 +556,20 @@ void PrintLanguage::recurse(void)
     mods = nodepend.back().vnmod;
     nodepend.pop_back();
     pending -= 1;
-    if (vn->isImplied()) {
+    if (vn->isImplied() && op->code()==CPUI_SEGMENTOP && isSelfReferentialRegisterArithmetic(vn) &&
+	pushSegmentRegisterExpression(vn,op)) {
+      // Handled -- print as "SP - 2" style expression instead of taking
+      // the normal isImplied() inline-expansion path below (which would
+      // print the raw register0x0e fallback via the arithmetic op's own
+      // push()). CORRECTED: gated on isImplied(), NOT isAnnotation() --
+      // a direct diagnostic (see review16.md) proved this Varnode has
+      // isAnnotation()=false, isImplied()=true, contradicting review15's
+      // original claim that both flags were set. pushVnExplicit()'s own
+      // isAnnotation()-gated intercept, added in an earlier session, is
+      // dead code for this shape and is left in place harmlessly in
+      // case some other annotation-only (non-implied) case exists.
+    }
+    else if (vn->isImplied()) {
       if (vn->hasImpliedField()) {
 	pushImpliedField(vn, op);
       }

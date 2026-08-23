@@ -19,6 +19,7 @@
 #include "subflow.hh"
 #include "constseq.hh"
 #include "bitfield.hh"
+#include <iostream>
 
 namespace ghidra {
 
@@ -669,6 +670,181 @@ int4 ActionSegmentize::apply(Funcdata &data)
       count += 1;
     }
   }
+  return 0;
+}
+
+/// \brief Check if a Varnode's value was computed by INT_ADD/INT_SUB
+/// against a constant -- the shape produced when a base/segment register
+/// is reassigned to a value computed from itself (e.g. H8 link/unlk's
+/// "SP = SP - 2"), landing back in the register's own storage. Confirmed
+/// via a live pcode dump (review15.md sections 9, 14) that the arithmetic
+/// op's OWN first input may be an intermediate unique/temporary Varnode
+/// rather than the register directly -- so this checks only the shape of
+/// the definition itself (INT_ADD/INT_SUB vs a constant), not what the
+/// arithmetic's own first operand is.
+/// \param vn is the Varnode to test
+/// \return \b true if vn is defined by arithmetic against a constant
+/// \brief Walk backward from a self-referential arithmetic Varnode to find
+/// the raw, unmodified register-space Varnode it was ultimately computed
+/// from, passing through any chain of CAST/COPY ops.
+///
+/// isSelfReferentialRegisterArithmetic(vn) confirms vn is defined by
+/// INT_ADD/INT_SUB against a constant, but the arithmetic's own first
+/// input is often an intermediate CAST/COPY result rather than the
+/// register directly (review15.md section 14's finding, still true).
+/// That upstream raw register-space read is a SEPARATE, distinct Varnode
+/// instance from vn, has no Symbol of its own, and if it is consumed
+/// directly by a print-visible operation (e.g. wrapped in "(short)..." by
+/// a CAST that itself appears in the decompiled expression) it prints via
+/// printlanguage.cc's pushSymbolDetail -> pushUnnamedLocation path -- a
+/// DIFFERENT print path than pushAnnotation, constructing the same
+/// "register0x0e" text independently. Confirmed via a live pcode dump
+/// (review15.md section 21+ follow-up, DumpAllSPInstances.java) that this
+/// upstream Varnode is what was still printing as register0x0e even after
+/// the SEGMENTOP-input Varnode itself was successfully linked to a Symbol.
+/// \param vn is the self-referential-arithmetic Varnode (already confirmed via isSelfReferentialRegisterArithmetic)
+/// \return the raw upstream register-space Varnode with no Symbol, or NULL if none found within a short walk
+static Varnode *findUpstreamRawRegisterRead(Varnode *vn)
+
+{
+  PcodeOp *def = vn->getDef();
+  if (def == (PcodeOp *)0) return (Varnode *)0;
+  Varnode *cur = def->getIn(0);
+  // Bounded walk (max 4 hops) through CAST/COPY-style single-input pass-through
+  // ops looking for a register-space Varnode with no Symbol yet. Bounded so a
+  // pathological/unexpected chain shape can't spin; every real case seen so far
+  // (review15.md section 21+ dump) is a single CAST hop.
+  for (int4 hops = 0; hops < 4 && cur != (Varnode *)0; ++hops) {
+    if (!cur->isConstant() && cur->getSpace()->getType() == IPTR_PROCESSOR
+	&& cur->getSymbolEntry() == (SymbolEntry *)0) {
+      return cur;
+    }
+    PcodeOp *curDef = cur->getDef();
+    if (curDef == (PcodeOp *)0) break;
+    if (curDef->numInput() != 1) break;	// Only follow single-input pass-through ops
+    cur = curDef->getIn(0);
+  }
+  return (Varnode *)0;
+}
+
+static bool isSelfReferentialRegisterArithmetic(Varnode *vn)
+
+{
+  if (vn == (Varnode *)0 || vn->isConstant()) return false;
+  PcodeOp *def = vn->getDef();
+  if (def == (PcodeOp *)0) return false;
+  OpCode opc = def->code();
+  if (opc != CPUI_INT_ADD && opc != CPUI_INT_SUB) return false;
+  if (def->numInput() != 2) return false;
+  Varnode *amt = def->getIn(1);
+  if (!amt->isConstant()) return false;
+  return true;
+}
+
+int4 ActionSegmentRegisterIdentity::apply(Funcdata &data)
+
+{
+  // NOTE: PcodeOpBank::begin(OpCode)/end(OpCode) only special-cases
+  // CPUI_STORE, CPUI_LOAD, CPUI_RETURN, and CPUI_CALLOTHER -- any other
+  // opcode, including CPUI_SEGMENTOP, silently returns an empty range
+  // (falls through to the default case, returning alivelist.end() as both
+  // begin and end). Confirmed via direct source read (op.cc,
+  // PcodeOpBank::begin(OpCode)) after four runtime iterations that each
+  // returned zero SEGMENTOP ops despite Java-side HighFunction confirming
+  // real SEGMENTOP ops exist in the same decompile -- see review15.md
+  // section 18. Must iterate all alive ops and filter by opcode manually.
+  list<PcodeOp *>::const_iterator iter,enditer;
+  iter = data.beginOpAlive();
+  enditer = data.endOpAlive();
+  int4 segopCount = 0;
+  int4 linkedCount = 0;
+  // NOTE: this Action runs inside actmainloop (rule_repeatapply), which
+  // completes entirely BEFORE ActionAssignHigh (registered separately at
+  // top-level "merge" group, coreaction.cc ~line 6216) ever runs -- so
+  // isHighOn() is never true here and vn->getHigh() is never safe to call
+  // in this Action. Confirmed via direct source read after the
+  // isHighOn()-guard fix (review15.md section 19) silently no-op'd on
+  // every pass instead of running later as originally assumed. Check
+  // vn->getSymbolEntry() directly instead (varnode.hh -- a plain field
+  // read, no HighVariable dependency, safe to call at any pipeline stage)
+  // rather than going through getHigh()->getSymbol().
+  while(iter != enditer) {
+    PcodeOp *segop = *iter++;
+    if (segop->code() != CPUI_SEGMENTOP) continue;
+    segopCount += 1;
+    if (segop->isDead()) continue;
+    for(int4 i=0;i<segop->numInput();++i) {
+      Varnode *vn = segop->getIn(i);
+      if (vn == (Varnode *)0 || vn->isConstant()) continue;
+      if (vn->getSymbolEntry() != (SymbolEntry *)0) continue;	// Already named
+      ostringstream dbg;
+      dbg << "ASRI seg@" << segop->getAddr() << " in[" << i << "] vn=";
+      vn->printRaw(dbg);
+      if (!isSelfReferentialRegisterArithmetic(vn)) {
+	dbg << " no-match";
+	data.warning(dbg.str(),segop->getAddr());
+	continue;
+      }
+      dbg << " MATCH-linking";
+      // NOTE: data.linkSymbol(vn) was tried first (review15.md section 21)
+      // and DID attach a Symbol named "SP" -- but printc.cc's pushAnnotation
+      // (the actual print path for a SEGMENTOP's raw input) does its OWN
+      // independent lookup: symScope->queryContainer(vn->getAddr(), size,
+      // op->getAddr()), bound to THIS segop's address as usepoint.
+      // linkSymbol() borrowed an existing overlapping entry via
+      // queryProperties() whose own usepoint range was established
+      // elsewhere and did not cover this segop's address, so
+      // queryContainer() here returned null and the register0x0e fallback
+      // still fired despite the Symbol genuinely existing. Use the new
+      // linkSymbolAtUsepoint() (funcdata_varnode.cc), which explicitly
+      // registers/finds an entry whose usepoint is THIS segop's address, so
+      // both lookups agree. (Varnode::setSymbolEntry is private to
+      // Funcdata, so this must go through a Funcdata method, not be done
+      // inline here.)
+      Symbol *sym = data.linkSymbolAtUsepoint(vn,segop->getAddr());
+      if (sym != (Symbol *)0)
+	dbg << " usepoint-linked:" << sym->getName();
+      // NOTE: linking vn (the SEGMENTOP's own input, e.g. the INT_ADD
+      // output for "SP = SP - 2") is not sufficient on its own -- the
+      // arithmetic's upstream raw register read (e.g. the CAST's input,
+      // the untouched pre-arithmetic SP value) is a SEPARATE Varnode
+      // instance that may ALSO print directly in the decompiled
+      // expression (e.g. "(short)register0x0e" wrapping that exact
+      // varnode) via a different print path (pushUnnamedLocation, not
+      // pushAnnotation) that this Action was not previously reaching.
+      // Confirmed via DumpAllSPInstances.java (review15.md section 21+
+      // follow-up) that this is genuinely a second, distinct varnode, not
+      // the same one seen twice. Link it too if present.
+      Varnode *upstream = findUpstreamRawRegisterRead(vn);
+      if (upstream != (Varnode *)0) {
+	Symbol *upSym = data.linkSymbolAtUsepoint(upstream,segop->getAddr());
+	if (upSym != (Symbol *)0) {
+	  // NOTE: linkSymbolAtUsepoint's underlying blank-name auto-naming
+	  // (ScopeInternal::buildVariableName, database.cc ~2630) was found to
+	  // independently assign the SAME default name (e.g. "sVar1") to both
+	  // this upstream symbol and the primary segop-input symbol
+	  // (review15.md section 25's HighVariable-identity trace: two
+	  // DISTINCT HighVariable objects, confirmed via identityHashCode,
+	  // both carrying an identical Symbol name) -- producing a
+	  // self-referential-looking assignment in the printed C (e.g.
+	  // "sVar1 = (short)sVar1 + -2;"). Force uniqueness explicitly here,
+	  // the one place that holds both Symbol pointers at once, rather
+	  // than touching the shared naming logic in database.cc/varmap.cc.
+	  if (sym != (Symbol *)0 && upSym->getName() == sym->getName()) {
+	    string uniqueName = data.getScopeLocal()->makeNameUnique(upSym->getName());
+	    data.getScopeLocal()->renameSymbol(upSym,uniqueName);
+	  }
+	  dbg << " upstream-linked:" << upSym->getName();
+	}
+      }
+      data.warning(dbg.str(),segop->getAddr());
+      linkedCount += 1;
+      count += 1;
+    }
+  }
+  ostringstream summary;
+  summary << "ASRI summary: segops=" << segopCount << " linked=" << linkedCount;
+  data.warningHeader(summary.str());
   return 0;
 }
 
@@ -6137,6 +6313,15 @@ void ActionDatabase::universalAction(Architecture *conf)
   act->addAction( new ActionStructureTransform("blockrecovery", true) );	// Allow mods
   act->addAction( new ActionNormalizeBranches("normalizebranches") );
   act->addAction( new ActionAssignHigh("merge") );
+  // DISABLED 2026-08-21: superseded by print-layer fix (pushSegmentRegisterExpression,
+  // printlanguage.cc/printc.cc). This Action still linked a real Symbol via
+  // linkSymbolAtUsepoint and emitted data.warning() debug text on every SEGMENTOP
+  // site, which ran earlier in the pipeline than printing and pre-empted/entangled
+  // with the new print-layer fallback, producing neither the old register0x0e
+  // output nor the intended "SP - 2" output. See review16.md step 4. Kept in
+  // source (coreaction.cc/.hh) as a fallback in case the print-layer approach
+  // needs one -- just no longer registered in the pipeline.
+  // act->addAction( new ActionSegmentRegisterIdentity("merge") );
   act->addAction( new ActionMergeRequired("merge") );
   act->addAction( new ActionMarkExplicit("merge") );
   act->addAction( new ActionMarkImplied("merge") ); // This must come BEFORE general merging
